@@ -308,23 +308,35 @@ func SteamAuthViaCM(ctx context.Context, sess *Session, username, password strin
 		interval = 5
 	}
 
+	
 	// Step 3 — handle Steam Guard if required.
-	// EAuthSessionGuardType: 1=None, 2=EmailCode, 3=DeviceCode(TOTP)
 	const (
-		guardTypeNone   = 1
-		guardTypeEmail  = 2
-		guardTypeDevice = 3
+		guardTypeNone              = 1
+		guardTypeEmail              = 2
+		guardTypeDevice             = 3
+		guardTypeDeviceConfirmation = 4
+		guardTypeEmailConfirmation  = 5
 	)
 	guardType := 0
 	for _, c := range beginResp.AllowedConfirmations {
-		if c.ConfirmationType != guardTypeNone {
-			guardType = int(c.ConfirmationType)
+		t := int(c.ConfirmationType)
+		if t == guardTypeDeviceConfirmation ||
+			t == guardTypeEmailConfirmation {
+			guardType = t
 			break
 		}
+		if guardType == 0 && t != guardTypeNone {
+			guardType = t
+		}
 	}
-	if guardType != 0 {
+
+	// Mobile/email approval happens in the Steam app; wait for
+	// Steam to issue tokens rather than requesting a one-time code.
+	if guardType != 0 &&
+		guardType != guardTypeDeviceConfirmation &&
+		guardType != guardTypeEmailConfirmation {
 		if guardType != guardTypeEmail && guardType != guardTypeDevice {
-			return nil, fmt.Errorf("auth: unsupported Steam Guard type %d (only email and TOTP are supported)", guardType)
+			return nil, fmt.Errorf("auth: unsupported Steam Guard type %d", guardType)
 		}
 		if guardCallback == nil {
 			return nil, fmt.Errorf("auth: Steam Guard required but no callback provided")
