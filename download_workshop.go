@@ -2,8 +2,14 @@ package steam
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/BirknerAlex/go-steam/internal/cdn"
 	"github.com/BirknerAlex/go-steam/internal/cm"
@@ -43,6 +49,14 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 	item, err := workshop.GetItemInfo(ctx, req.ItemID)
 	if err != nil {
 		return fmt.Errorf("workshop: resolve item %d: %w", req.ItemID, err)
+	}
+
+	// 1b. Legacy items predate workshop depots: Steam keeps them as a single file
+	// and hands it over from a plain URL, so there is no depot or manifest to ask
+	// for. Games such as Left 4 Dead 2 publish every item this way.
+	if item.FileURL != "" {
+		slog.Debug("workshop: single-file item", "item", req.ItemID, "url", item.FileURL)
+		return c.downloadWorkshopFile(ctx, req, item, send)
 	}
 
 	// 2. Workshop items always use an authenticated session.
@@ -256,3 +270,81 @@ func (c *Client) fetchWorkshopManifest(
 	return cdn.DownloadManifest(ctx, c.cdnClient.HTTP(), server, depotID, item.ManifestGID, depotKey, token, requestCode)
 }
 
+
+
+// downloadWorkshopFile fetches a single-file Workshop item. These items live in
+// Steam's UGC storage rather than a depot, so the whole item arrives as one
+// download and lands in TargetDir under the name it was published with.
+func (c *Client) downloadWorkshopFile(ctx context.Context, req WorkshopDownloadRequest,
+	item *workshop.Item, send func(Progress)) error {
+	name := safeWorkshopFileName(item.FileName)
+	if name == "" {
+		name = fmt.Sprintf("%d.vpk", item.ItemID)
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, item.FileURL, nil)
+	if err != nil {
+		return fmt.Errorf("workshop: file request for item %d: %w", req.ItemID, err)
+	}
+	resp, err := c.cdnClient.HTTP().Do(request)
+	if err != nil {
+		return fmt.Errorf("workshop: file download for item %d: %w", req.ItemID, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("workshop: item %d file HTTP %d from %s",
+			req.ItemID, resp.StatusCode, item.FileURL)
+	}
+
+	total := resp.ContentLength
+	if total <= 0 {
+		total = item.FileSize
+	}
+
+	path := filepath.Join(req.TargetDir, name)
+	file, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("workshop: item %d file %s: %w", req.ItemID, name, err)
+	}
+	defer file.Close()
+
+	send(Progress{Phase: PhaseDownloading, TotalBytes: total, CurrentFile: name})
+
+	buf := make([]byte, 256*1024)
+	var done int64
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, writeErr := file.Write(buf[:n]); writeErr != nil {
+				return fmt.Errorf("workshop: item %d file %s: %w", req.ItemID, name, writeErr)
+			}
+			done += int64(n)
+			send(Progress{Phase: PhaseDownloading, TotalBytes: total,
+				DoneBytes: done, CurrentFile: name})
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("workshop: item %d file %s: %w", req.ItemID, name, readErr)
+		}
+	}
+
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("workshop: item %d file %s: %w", req.ItemID, name, err)
+	}
+	slog.Debug("workshop: single-file item written", "item", req.ItemID, "file", name, "bytes", done)
+	send(Progress{Phase: PhaseComplete})
+	return nil
+}
+
+// safeWorkshopFileName keeps a published name from escaping the target folder.
+func safeWorkshopFileName(name string) string {
+	name = strings.TrimSpace(strings.ReplaceAll(name, "\\", "/"))
+	name = filepath.Base(name)
+	if name == "." || name == ".." || name == "/" {
+		return ""
+	}
+	return name
+}

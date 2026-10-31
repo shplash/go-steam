@@ -28,18 +28,25 @@ type Item struct {
 	Title string
 	// FileSize is the total size in bytes as reported by the WebAPI.
 	FileSize int64
+	// FileName is the name the item was published under.
+	FileName string
+	// FileURL is set for legacy single-file items, which Steam serves from its
+	// UGC storage as one download instead of a depot manifest.
+	FileURL string
 	// Updated is when the item was last published/updated.
 	Updated time.Time
 }
 
 type publishedFileDetails struct {
-	Result         int    `json:"result"`
+	Result          int    `json:"result"`
 	PublishedFileID string `json:"publishedfileid"`
-	ConsumerAppID  int    `json:"consumer_app_id"`
-	HContentFile   string `json:"hcontent_file"`
-	Title          string `json:"title"`
-	FileSize       string `json:"file_size"`
-	TimeUpdated    int64  `json:"time_updated"`
+	ConsumerAppID   int    `json:"consumer_app_id"`
+	HContentFile    string `json:"hcontent_file"`
+	Title           string `json:"title"`
+	FileSize        string `json:"file_size"`
+	FileName        string `json:"filename"`
+	FileURL         string `json:"file_url"`
+	TimeUpdated     int64  `json:"time_updated"`
 }
 
 type getPublishedFileResponse struct {
@@ -105,6 +112,8 @@ func GetItemInfo(ctx context.Context, itemID uint64) (*Item, error) {
 		DepotID:     appID, // Workshop items use the app's depot by convention
 		Title:       d.Title,
 		FileSize:    fileSize,
+		FileName:    d.FileName,
+		FileURL:     d.FileURL,
 		Updated:     time.Unix(d.TimeUpdated, 0),
 	}
 	return item, nil
