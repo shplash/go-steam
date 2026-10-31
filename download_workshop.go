@@ -165,6 +165,24 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 	}
 	c.manifestSem.Release(1)
 	if manifest == nil {
+		// Items that never had a depot manifest are kept in Steam's cloud storage
+		// instead. Ask where the file is and fetch it straight from there.
+		file, cloudErr := sess.GetUGCFile(ctx, item.AppID, item.ManifestGID)
+		if cloudErr == nil && file.URL != "" {
+			slog.Debug("workshop: cloud file", "item", req.ItemID,
+				"filename", file.Filename, "bytes", file.FileSize)
+			item.FileURL = file.URL
+			if file.Filename != "" {
+				item.FileName = file.Filename
+			}
+			return c.downloadWorkshopFile(ctx, req, item, send)
+		}
+		switch {
+		case cloudErr != nil:
+			lastErr = fmt.Errorf("cloud file: %w", cloudErr)
+		case file != nil:
+			lastErr = fmt.Errorf("Steam has no download URL for this item")
+		}
 		if guessedDepot {
 			return fmt.Errorf("workshop: manifest for item %d: Steam lists no workshop depot for app %d, so depots %v were tried and each refused it: %w",
 				req.ItemID, item.AppID, depots, lastErr)
