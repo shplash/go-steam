@@ -220,6 +220,16 @@ func decodeManifest(raw, depotKey []byte, depotID uint32, gid uint64) (*Manifest
 		}
 	}
 
+	// Some manifests use an encoding the section walk above does not recognise,
+	// which leaves an otherwise valid response looking empty. Before giving up,
+	// try the body (and each zip entry) as a plain payload protobuf.
+	if len(payload.Mappings) == 0 {
+		if recovered, ok := payloadFallback(raw, depotKey); ok {
+			slog.Debug("decodeManifest: recovered payload from fallback", "depot", depotID, "files", len(recovered.Mappings))
+			payload = recovered
+		}
+	}
+
 	// Decrypt filenames if the manifest uses encrypted filenames.
 	if metadata.FilenamesEncrypted && len(depotKey) == 32 {
 		slog.Debug("decodeManifest: decrypting filenames", "depot", depotID)
@@ -475,4 +485,48 @@ func decryptFilename(rawname string, depotKey []byte) (string, error) {
 // normalizePath converts Steam's Windows-style backslashes to forward slashes.
 func normalizePath(p string) string {
 	return strings.ReplaceAll(p, "\\", "/")
+}
+
+
+// payloadFallback looks for a payload protobuf in a manifest this package could
+// not walk: either the body itself, or one of the entries of a zip-wrapped
+// manifest, each also tried decrypted and decompressed.
+func payloadFallback(raw, depotKey []byte) (proto.ContentManifestPayload, bool) {
+	var empty proto.ContentManifestPayload
+
+	variants := make([][]byte, 0, 4)
+	if len(raw) >= 4 && binary.LittleEndian.Uint32(raw[:4]) == 0x04034B50 {
+		if zr, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw))); err == nil {
+			for _, f := range zr.File {
+				rc, err := f.Open()
+				if err != nil {
+					continue
+				}
+				if body, err := io.ReadAll(rc); err == nil {
+					variants = append(variants, body)
+				}
+				rc.Close()
+			}
+		}
+	}
+	variants = append(variants, raw)
+
+	for _, variant := range variants {
+		candidates := [][]byte{variant}
+		if len(depotKey) == 32 {
+			if plain, err := decryptManifestSection(variant, depotKey); err == nil {
+				candidates = append(candidates, plain)
+			}
+		}
+		if plain, err := lzmaDecompress(variant); err == nil {
+			candidates = append(candidates, plain)
+		}
+		for _, candidate := range candidates {
+			var payload proto.ContentManifestPayload
+			if err := payload.Unmarshal(candidate); err == nil && len(payload.Mappings) > 0 {
+				return payload, true
+			}
+		}
+	}
+	return empty, false
 }

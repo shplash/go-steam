@@ -119,12 +119,18 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 			continue
 		}
 		// A missing request code is not fatal: some CDN cells want it, others
-		// refuse a manifest that carries one, so both forms are tried.
+		// refuse a manifest that carries one, so both forms are tried. The code
+		// request itself can be lost on a busy connection, and a second attempt
+		// often returns the code the first one missed.
 		requestCode, codeErr := sess.GetManifestRequestCode(ctx, item.AppID, depotID, item.ManifestGID, "public")
+		if codeErr == nil && requestCode == 0 {
+			requestCode, codeErr = sess.GetManifestRequestCode(ctx, item.AppID, depotID, item.ManifestGID, "public")
+		}
 		if codeErr != nil {
 			lastErr = fmt.Errorf("depot %d manifest request code: %w", depotID, codeErr)
 			slog.Debug("workshop: no manifest request code", "depot", depotID, "err", codeErr)
 		}
+		slog.Debug("workshop: manifest request code", "depot", depotID, "code", requestCode, "err", codeErr)
 		codes := make([]uint64, 0, 2)
 		if requestCode > 0 {
 			codes = append(codes, requestCode)
