@@ -179,7 +179,7 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 		}
 		switch {
 		case cloudErr != nil:
-			lastErr = fmt.Errorf("cloud file: %w", cloudErr)
+			lastErr = cloudErr
 		case file != nil:
 			lastErr = fmt.Errorf("Steam has no download URL for this item")
 		}
