@@ -53,10 +53,18 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 	// workshop depot is listed under "workshopdepot" in the app's PICS data.
 	send(Progress{Phase: PhaseManifest})
 	appInfo, err := sess.GetAppInfo(ctx, item.AppID)
-	if err == nil && appInfo.WorkshopDepot != 0 {
+	if err != nil {
+		return fmt.Errorf("workshop: app %d info for item %d: %w", item.AppID, req.ItemID, err)
+	}
+	// Old apps such as Left 4 Dead 2 list no workshopdepot in their PICS data.
+	// The item's depot then falls back to the consumer app id, which is a guess
+	// worth reporting rather than silently trusting.
+	guessedDepot := appInfo.WorkshopDepot == 0
+	if !guessedDepot {
 		item.DepotID = appInfo.WorkshopDepot
 	}
-	slog.Debug("workshop: resolved depot", "item", req.ItemID, "app", item.AppID, "depot", item.DepotID, "manifest", item.ManifestGID)
+	slog.Debug("workshop: resolved depot", "item", req.ItemID, "app", item.AppID,
+		"depot", item.DepotID, "manifest", item.ManifestGID, "workshop_depot", appInfo.WorkshopDepot)
 
 	// 4. Fetch depot key.
 	keyProvider := cm.NewDepotKeyProvider(c.cache, sess)
@@ -75,12 +83,28 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 		return err
 	}
 	tp := newTokenProvider(c, sess, item.AppID)
-	requestCode, _ := sess.GetManifestRequestCode(ctx, item.AppID, item.DepotID, item.ManifestGID, "public")
-	token, _ := tp.GetToken(ctx, item.DepotID, server.Host)
+	requestCode, err := sess.GetManifestRequestCode(ctx, item.AppID, item.DepotID, item.ManifestGID, "public")
+	if err != nil {
+		c.manifestSem.Release(1)
+		return fmt.Errorf("workshop: manifest request code for item %d (app %d, depot %d, manifest %d): %w",
+			req.ItemID, item.AppID, item.DepotID, item.ManifestGID, err)
+	}
+	token, err := tp.GetToken(ctx, item.DepotID, server.Host)
+	if err != nil {
+		c.manifestSem.Release(1)
+		return fmt.Errorf("workshop: CDN token for item %d (depot %d, %s): %w",
+			req.ItemID, item.DepotID, server.Host, err)
+	}
+	slog.Debug("workshop: manifest request", "item", req.ItemID, "depot", item.DepotID,
+		"code", requestCode, "token", token != "")
 
 	manifest, err := cdn.DownloadManifest(ctx, c.cdnClient.HTTP(), server, item.DepotID, item.ManifestGID, depotKey, token, requestCode)
 	c.manifestSem.Release(1)
 	if err != nil {
+		if guessedDepot {
+			return fmt.Errorf("workshop: manifest for item %d: Steam lists no workshop depot for app %d, so the item was requested from depot %d, which refused it: %w",
+				req.ItemID, item.AppID, item.DepotID, err)
+		}
 		return fmt.Errorf("workshop: manifest for item %d: %w", req.ItemID, err)
 	}
 
