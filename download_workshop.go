@@ -133,12 +133,18 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 
 		for _, code := range codes {
 			fetched, fetchErr := c.fetchWorkshopManifest(ctx, tp, server, depotID, item, depotKey, code)
+			// A manifest that parses but lists nothing is not a success: the depot
+			// answered, but not with this item's files. Keep looking rather than
+			// reporting a finished download that installs nothing.
+			if fetchErr == nil && len(fetched.Files) == 0 {
+				fetchErr = fmt.Errorf("manifest listed no files")
+			}
 			if fetchErr == nil {
 				manifest = fetched
 				chosenDepotKey = depotKey
 				item.DepotID = depotID
 				slog.Debug("workshop: manifest fetched", "item", req.ItemID, "depot", depotID,
-					"code", code, "candidates", len(depots))
+					"code", code, "files", len(fetched.Files), "candidates", len(depots))
 				break
 			}
 			lastErr = fmt.Errorf("depot %d manifest (request code %d): %w", depotID, code, fetchErr)
