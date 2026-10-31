@@ -66,11 +66,17 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 	slog.Debug("workshop: resolved depot", "item", req.ItemID, "app", item.AppID,
 		"depot", item.DepotID, "manifest", item.ManifestGID, "workshop_depot", appInfo.WorkshopDepot)
 
-	// 4. Fetch depot key.
+	// 4. Fetch depot keys and the manifest. A workshop item can sit in the app's
+	// workshop depot or, for games that never list one, in the consumer app's own
+	// depot, so every candidate is tried rather than guessed at.
 	keyProvider := cm.NewDepotKeyProvider(c.cache, sess)
-	depotKey, err := keyProvider.GetDepotKey(ctx, item.AppID, item.DepotID)
-	if err != nil {
-		return fmt.Errorf("workshop: depot key for item %d: %w", req.ItemID, err)
+	depots := make([]uint32, 0, 3)
+	seen := make(map[uint32]bool, 3)
+	for _, candidate := range []uint32{item.DepotID, appInfo.WorkshopDepot, item.AppID} {
+		if candidate != 0 && !seen[candidate] {
+			seen[candidate] = true
+			depots = append(depots, candidate)
+		}
 	}
 
 	// 5. Download manifest (with manifest request code for modern CDN auth).
@@ -83,29 +89,61 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 		return err
 	}
 	tp := newTokenProvider(c, sess, item.AppID)
-	requestCode, err := sess.GetManifestRequestCode(ctx, item.AppID, item.DepotID, item.ManifestGID, "public")
-	if err != nil {
-		c.manifestSem.Release(1)
-		return fmt.Errorf("workshop: manifest request code for item %d (app %d, depot %d, manifest %d): %w",
-			req.ItemID, item.AppID, item.DepotID, item.ManifestGID, err)
-	}
-	token, err := tp.GetToken(ctx, item.DepotID, server.Host)
-	if err != nil {
-		c.manifestSem.Release(1)
-		return fmt.Errorf("workshop: CDN token for item %d (depot %d, %s): %w",
-			req.ItemID, item.DepotID, server.Host, err)
-	}
-	slog.Debug("workshop: manifest request", "item", req.ItemID, "depot", item.DepotID,
-		"code", requestCode, "token", token != "")
 
-	manifest, err := cdn.DownloadManifest(ctx, c.cdnClient.HTTP(), server, item.DepotID, item.ManifestGID, depotKey, token, requestCode)
-	c.manifestSem.Release(1)
-	if err != nil {
-		if guessedDepot {
-			return fmt.Errorf("workshop: manifest for item %d: Steam lists no workshop depot for app %d, so the item was requested from depot %d, which refused it: %w",
-				req.ItemID, item.AppID, item.DepotID, err)
+	var manifest *cdn.Manifest
+	var chosenDepotKey []byte
+	var lastErr error
+	for _, depotID := range depots {
+		if ctx.Err() != nil {
+			c.manifestSem.Release(1)
+			return ctx.Err()
 		}
-		return fmt.Errorf("workshop: manifest for item %d: %w", req.ItemID, err)
+		depotKey, keyErr := keyProvider.GetDepotKey(ctx, item.AppID, depotID)
+		if keyErr != nil {
+			lastErr = fmt.Errorf("depot %d key: %w", depotID, keyErr)
+			slog.Debug("workshop: depot key failed", "depot", depotID, "err", keyErr)
+			continue
+		}
+		// A missing request code is not fatal: some CDN cells want it, others
+		// refuse a manifest that carries one, so both forms are tried.
+		requestCode, codeErr := sess.GetManifestRequestCode(ctx, item.AppID, depotID, item.ManifestGID, "public")
+		if codeErr != nil {
+			lastErr = fmt.Errorf("depot %d manifest request code: %w", depotID, codeErr)
+			slog.Debug("workshop: no manifest request code", "depot", depotID, "err", codeErr)
+		}
+		codes := make([]uint64, 0, 2)
+		if requestCode > 0 {
+			codes = append(codes, requestCode)
+		}
+		codes = append(codes, 0)
+
+		for _, code := range codes {
+			fetched, fetchErr := c.fetchWorkshopManifest(ctx, tp, server, depotID, item, depotKey, code)
+			if fetchErr == nil {
+				manifest = fetched
+				chosenDepotKey = depotKey
+				item.DepotID = depotID
+				slog.Debug("workshop: manifest fetched", "item", req.ItemID, "depot", depotID,
+					"code", code, "candidates", len(depots))
+				break
+			}
+			lastErr = fmt.Errorf("depot %d manifest (request code %d): %w", depotID, code, fetchErr)
+			slog.Debug("workshop: manifest attempt failed", "depot", depotID, "code", code, "err", fetchErr)
+			if ctx.Err() != nil {
+				break
+			}
+		}
+		if manifest != nil {
+			break
+		}
+	}
+	c.manifestSem.Release(1)
+	if manifest == nil {
+		if guessedDepot {
+			return fmt.Errorf("workshop: manifest for item %d: Steam lists no workshop depot for app %d, so depots %v were tried and each refused it: %w",
+				req.ItemID, item.AppID, depots, lastErr)
+		}
+		return fmt.Errorf("workshop: manifest for item %d (depots %v): %w", req.ItemID, depots, lastErr)
 	}
 
 	// 5. Diff against target directory.
@@ -158,19 +196,19 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 				return
 			}
 			tok, _ := tp.GetToken(ctx, item.DepotID, srv.Host)
-			data, err := cdn.DownloadChunk(ctx, c.cdnClient.HTTP(), srv, item.DepotID, cw.chunk, depotKey, tok)
+			data, err := cdn.DownloadChunk(ctx, c.cdnClient.HTTP(), srv, item.DepotID, cw.chunk, chosenDepotKey, tok)
 			if cdn.IsUnauthorized(err) {
 				// Drop the stale token before re-requesting, otherwise GetToken
 				// returns the same cached value and the retry is a no-op.
 				tp.InvalidateToken(item.DepotID, srv.Host)
 				tok, _ = tp.GetToken(ctx, item.DepotID, srv.Host)
-				data, err = cdn.DownloadChunk(ctx, c.cdnClient.HTTP(), srv, item.DepotID, cw.chunk, depotKey, tok)
+				data, err = cdn.DownloadChunk(ctx, c.cdnClient.HTTP(), srv, item.DepotID, cw.chunk, chosenDepotKey, tok)
 			}
 			if cdn.IsCorrupt(err) {
 				c.cdnClient.Penalise(srv)
 				if srv, err = c.cdnClient.GetServer(); err == nil {
 					tok, _ = tp.GetToken(ctx, item.DepotID, srv.Host)
-					data, err = cdn.DownloadChunk(ctx, c.cdnClient.HTTP(), srv, item.DepotID, cw.chunk, depotKey, tok)
+					data, err = cdn.DownloadChunk(ctx, c.cdnClient.HTTP(), srv, item.DepotID, cw.chunk, chosenDepotKey, tok)
 				}
 			}
 			if err != nil {
@@ -198,3 +236,23 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 	send(Progress{Phase: PhaseComplete})
 	return nil
 }
+
+// fetchWorkshopManifest makes one manifest request, fetching a CDN token for the
+// depot in question first. A token error is reported rather than sent on as an
+// empty token, which would come back as an authorization failure further down.
+func (c *Client) fetchWorkshopManifest(
+	ctx context.Context,
+	tp *tokenProviderWrapper,
+	server *cdn.Server,
+	depotID uint32,
+	item *workshop.Item,
+	depotKey []byte,
+	requestCode uint64,
+) (*cdn.Manifest, error) {
+	token, err := tp.GetToken(ctx, depotID, server.Host)
+	if err != nil {
+		return nil, fmt.Errorf("CDN token: %w", err)
+	}
+	return cdn.DownloadManifest(ctx, c.cdnClient.HTTP(), server, depotID, item.ManifestGID, depotKey, token, requestCode)
+}
+
