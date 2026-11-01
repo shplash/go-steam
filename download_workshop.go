@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/BirknerAlex/go-steam/internal/cdn"
@@ -90,6 +91,19 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 		if candidate != 0 && !seen[candidate] {
 			seen[candidate] = true
 			depots = append(depots, candidate)
+		}
+	}
+	// An item can sit in a depot the app never flags as its workshop depot, so
+	// every depot the app lists is worth asking about too.
+	extra := make([]uint32, 0, len(appInfo.Depots))
+	for id := range appInfo.Depots {
+		extra = append(extra, id)
+	}
+	sort.Slice(extra, func(i, j int) bool { return extra[i] < extra[j] })
+	for _, id := range extra {
+		if !seen[id] {
+			seen[id] = true
+			depots = append(depots, id)
 		}
 	}
 
