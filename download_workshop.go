@@ -177,10 +177,14 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 			}
 			return c.downloadWorkshopFile(ctx, req, item, send)
 		}
+		// Keep the depot failure: the cloud fallback only ran because the depot
+		// path failed, so replacing its error hides the reason we started here.
 		switch {
+		case cloudErr != nil && lastErr != nil:
+			lastErr = fmt.Errorf("%w; cloud fallback: %v", lastErr, cloudErr)
 		case cloudErr != nil:
 			lastErr = cloudErr
-		case file != nil:
+		case file != nil && lastErr == nil:
 			lastErr = fmt.Errorf("Steam has no download URL for this item")
 		}
 		if guessedDepot {
