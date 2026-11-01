@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/ulikunitz/xz/lzma"
+	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/BirknerAlex/go-steam/internal/proto"
 )
@@ -521,6 +522,19 @@ func payloadFallback(raw, depotKey []byte) (proto.ContentManifestPayload, bool) 
 		if plain, err := lzmaDecompress(variant); err == nil {
 			candidates = append(candidates, plain)
 		}
+		// Newer manifests wrap the payload in a ContentManifest message, so the
+		// payload has to be unwrapped before it can be decoded.
+		if wrapped, ok := unwrapContentManifest(variant); ok {
+			candidates = append(candidates, wrapped)
+			if len(depotKey) == 32 {
+				if plain, err := decryptManifestSection(wrapped, depotKey); err == nil {
+					candidates = append(candidates, plain)
+				}
+			}
+			if plain, err := lzmaDecompress(wrapped); err == nil {
+				candidates = append(candidates, plain)
+			}
+		}
 		for _, candidate := range candidates {
 			var payload proto.ContentManifestPayload
 			if err := payload.Unmarshal(candidate); err == nil && len(payload.Mappings) > 0 {
@@ -529,4 +543,29 @@ func payloadFallback(raw, depotKey []byte) (proto.ContentManifestPayload, bool) 
 		}
 	}
 	return empty, false
+}
+
+// unwrapContentManifest pulls the payload (field 1) out of a ContentManifest
+// wrapper, which some manifests use instead of the magic-prefixed sections.
+func unwrapContentManifest(data []byte) ([]byte, bool) {
+	for len(data) > 0 {
+		num, typ, n := protowire.ConsumeTag(data)
+		if n < 0 {
+			return nil, false
+		}
+		data = data[n:]
+		if num == 1 && typ == protowire.BytesType {
+			value, n := protowire.ConsumeBytes(data)
+			if n < 0 || len(value) == 0 {
+				return nil, false
+			}
+			return value, true
+		}
+		n = protowire.ConsumeFieldValue(num, typ, data)
+		if n < 0 {
+			return nil, false
+		}
+		data = data[n:]
+	}
+	return nil, false
 }
