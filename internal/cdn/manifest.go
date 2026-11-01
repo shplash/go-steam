@@ -140,7 +140,9 @@ func decodeManifest(raw, depotKey []byte, depotID uint32, gid uint64) (*Manifest
 		}
 		payload, metadata = p, m
 	} else if len(raw) >= 4 && binary.LittleEndian.Uint32(raw[:4]) == 0x04034B50 {
-		// ZIP magic 0x04034B50 — newer Steam CDN manifest format.
+		// ZIP magic 0x04034B50 — newer Steam CDN manifest format. The archive can
+		// hold more than one entry (payload, metadata, signature), so every entry
+		// is read rather than just the first.
 		slog.Debug("decodeManifest: ZIP format detected")
 		zr, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
 		if err != nil {
@@ -149,89 +151,21 @@ func decodeManifest(raw, depotKey []byte, depotID uint32, gid uint64) (*Manifest
 		if len(zr.File) == 0 {
 			return nil, fmt.Errorf("manifest: empty zip archive for depot %d", depotID)
 		}
-		rc, err := zr.File[0].Open()
-		if err != nil {
-			return nil, fmt.Errorf("manifest: open zip entry: %w", err)
-		}
-		entryBytes, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
-			return nil, fmt.Errorf("manifest: read zip entry: %w", err)
-		}
-		slog.Debug("decodeManifest: zip entry", "name", zr.File[0].Name, "size", len(entryBytes))
-
-		// The zip entry uses the magic-prefixed section format (Steam "old binary" format):
-		//   uint32 magic  (PROTOBUF_PAYLOAD_MAGIC=0x71F617D0, METADATA=0x1F4812BE, ...)
-		//   uint32 size
-		//   [size bytes]  (proto bytes, possibly AES-CBC+LZMA encrypted)
-		// repeated until PROTOBUF_ENDOFMANIFEST_MAGIC (0x32C415AB).
-		entryPos := 0
-		for entryPos+8 <= len(entryBytes) {
-			sectionMagic := binary.LittleEndian.Uint32(entryBytes[entryPos:])
-			sectionSize := binary.LittleEndian.Uint32(entryBytes[entryPos+4:])
-			entryPos += 8
-
-			if sectionMagic == 0x32C415AB { // PROTOBUF_ENDOFMANIFEST_MAGIC
-				break
-			}
-			if entryPos+int(sectionSize) > len(entryBytes) {
-				slog.Debug("decodeManifest: section overflows entry", "magic", fmt.Sprintf("%08x", sectionMagic), "size", sectionSize)
-				break
-			}
-			section := entryBytes[entryPos : entryPos+int(sectionSize)]
-			entryPos += int(sectionSize)
-			slog.Debug("decodeManifest: entry section", "magic", fmt.Sprintf("%08x", sectionMagic), "size", sectionSize)
-
-			// Sections may be AES-CBC encrypted then LZMA compressed.
-			if len(depotKey) == 32 {
-				if dec, err := decryptManifestSection(section, depotKey); err == nil {
-					section = dec
-				}
-			}
-			if dec, err := lzmaDecompress(section); err == nil {
-				section = dec
-			}
-
-			switch sectionMagic {
-			case 0x71F617D0: // PROTOBUF_PAYLOAD_MAGIC
-				if err := payload.Unmarshal(section); err != nil {
-					slog.Debug("decodeManifest: payload unmarshal failed", "err", err)
-				} else {
-					slog.Debug("decodeManifest: payload parsed", "files", len(payload.Mappings))
-				}
-			case 0x1F4812BE: // PROTOBUF_METADATA_MAGIC
-				_ = metadata.Unmarshal(section)
-			}
-		}
-	} else {
-		// Legacy size-prefixed section format.
-		pos := 0
-		sectionIdx := 0
-		for pos < len(raw)-4 {
-			size := binary.LittleEndian.Uint32(raw[pos:])
-			pos += 4
-			if int(pos)+int(size) > len(raw) {
-				slog.Debug("decodeManifest: section overflows raw", "section", sectionIdx, "size", size, "remaining", len(raw)-pos)
-				break
-			}
-			section := raw[pos : pos+int(size)]
-			pos += int(size)
-
-			if len(depotKey) == 32 {
-				if decrypted, err := decryptManifestSection(section, depotKey); err == nil {
-					section = decrypted
-				}
-			}
-			if decompressed, err := lzmaDecompress(section); err == nil {
-				section = decompressed
-			}
-			if err := payload.Unmarshal(section); err == nil && len(payload.Mappings) > 0 {
-				sectionIdx++
+		for _, file := range zr.File {
+			rc, err := file.Open()
+			if err != nil {
 				continue
 			}
-			_ = metadata.Unmarshal(section)
-			sectionIdx++
+			body, readErr := io.ReadAll(rc)
+			rc.Close()
+			if readErr != nil {
+				continue
+			}
+			slog.Debug("decodeManifest: zip entry", "name", file.Name, "size", len(body))
+			payload, metadata = decodeManifestSections(body, depotKey, payload, metadata)
 		}
+	} else {
+		payload, metadata = decodeManifestSections(raw, depotKey, payload, metadata)
 	}
 
 	// Some manifests use an encoding the section walk above does not recognise,
@@ -446,7 +380,7 @@ func decryptManifestSection(data, key []byte) ([]byte, error) {
 	}
 	pad := int(plaintext[len(plaintext)-1])
 	if pad < 1 || pad > aes.BlockSize || pad > len(plaintext) {
-		return plaintext, nil
+		return nil, fmt.Errorf("manifest: section padding is invalid")
 	}
 	return plaintext[:len(plaintext)-pad], nil
 }
@@ -581,4 +515,129 @@ func unwrapContentManifest(data []byte) ([]byte, bool) {
 		data = data[n:]
 	}
 	return nil, false
+}
+
+
+// decodeManifestSections reads one manifest body, in whichever of the layouts
+// Steam has used: magic-prefixed sections, size-prefixed sections, or a plain
+// payload protobuf.
+func decodeManifestSections(body, depotKey []byte, payload proto.ContentManifestPayload,
+	metadata proto.ContentManifestMetadata) (proto.ContentManifestPayload, proto.ContentManifestMetadata) {
+	if len(body) >= 8 {
+		magic := binary.LittleEndian.Uint32(body)
+		if magic == 0x71F617D0 || magic == 0x1F4812BE {
+			payload, metadata = walkMagicSections(body, depotKey, payload, metadata)
+		}
+	}
+	if len(payload.Mappings) == 0 {
+		payload, metadata = walkSizeSections(body, depotKey, payload, metadata)
+	}
+	if len(payload.Mappings) == 0 {
+		for _, candidate := range sectionCandidates(body, depotKey) {
+			var p proto.ContentManifestPayload
+			if p.Unmarshal(candidate) == nil && len(p.Mappings) > 0 {
+				payload = p
+				break
+			}
+		}
+	}
+	return payload, metadata
+}
+
+// walkMagicSections reads the magic-prefixed ("old binary") layout:
+//
+//	uint32 magic  (0x71F617D0 payload, 0x1F4812BE metadata, …)
+//	uint32 size
+//	[size bytes]  (protobuf, possibly AES-CBC then LZMA)
+//
+// repeated until 0x32C415AB.
+func walkMagicSections(body, depotKey []byte, payload proto.ContentManifestPayload,
+	metadata proto.ContentManifestMetadata) (proto.ContentManifestPayload, proto.ContentManifestMetadata) {
+	pos := 0
+	for pos+8 <= len(body) {
+		sectionMagic := binary.LittleEndian.Uint32(body[pos:])
+		sectionSize := binary.LittleEndian.Uint32(body[pos+4:])
+		pos += 8
+
+		if sectionMagic == 0x32C415AB {
+			break
+		}
+		if pos+int(sectionSize) > len(body) {
+			break
+		}
+		section := body[pos : pos+int(sectionSize)]
+		pos += int(sectionSize)
+
+		switch sectionMagic {
+		case 0x71F617D0:
+			for _, candidate := range sectionCandidates(section, depotKey) {
+				var p proto.ContentManifestPayload
+				if p.Unmarshal(candidate) == nil && len(p.Mappings) > 0 {
+					payload = p
+					break
+				}
+			}
+		case 0x1F4812BE:
+			for _, candidate := range sectionCandidates(section, depotKey) {
+				var m proto.ContentManifestMetadata
+				if m.Unmarshal(candidate) == nil && (m.DepotID != 0 || m.GIDManifest != 0 || m.FilenamesEncrypted) {
+					metadata = m
+					break
+				}
+			}
+		}
+	}
+	return payload, metadata
+}
+
+// walkSizeSections reads the legacy layout: a size-prefixed section, repeated.
+func walkSizeSections(body, depotKey []byte, payload proto.ContentManifestPayload,
+	metadata proto.ContentManifestMetadata) (proto.ContentManifestPayload, proto.ContentManifestMetadata) {
+	pos := 0
+	for pos+4 <= len(body) {
+		size := binary.LittleEndian.Uint32(body[pos:])
+		pos += 4
+		if pos+int(size) > len(body) {
+			break
+		}
+		section := body[pos : pos+int(size)]
+		pos += int(size)
+
+		for _, candidate := range sectionCandidates(section, depotKey) {
+			var p proto.ContentManifestPayload
+			if p.Unmarshal(candidate) == nil && len(p.Mappings) > 0 {
+				payload = p
+				break
+			}
+		}
+		if len(payload.Mappings) > 0 {
+			continue
+		}
+		for _, candidate := range sectionCandidates(section, depotKey) {
+			var m proto.ContentManifestMetadata
+			if m.Unmarshal(candidate) == nil && (m.DepotID != 0 || m.GIDManifest != 0 || m.FilenamesEncrypted) {
+				metadata = m
+				break
+			}
+		}
+	}
+	return payload, metadata
+}
+
+// sectionCandidates lists the ways a section may be encoded, plain first so a
+// readable protobuf is never replaced by a speculative decrypt.
+func sectionCandidates(section, depotKey []byte) [][]byte {
+	candidates := [][]byte{section}
+	if plain, err := lzmaDecompress(section); err == nil {
+		candidates = append(candidates, plain)
+	}
+	if len(depotKey) == 32 {
+		if plain, err := decryptManifestSection(section, depotKey); err == nil {
+			candidates = append(candidates, plain)
+			if decompressed, err := lzmaDecompress(plain); err == nil {
+				candidates = append(candidates, decompressed)
+			}
+		}
+	}
+	return candidates
 }
