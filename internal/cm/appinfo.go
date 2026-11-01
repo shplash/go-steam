@@ -49,6 +49,9 @@ type AppInfo struct {
 	Type          string // "game", "tool", "server", etc.
 	Depots        map[uint32]*DepotInfo
 	WorkshopDepot uint32 // depot used for workshop content; 0 if not set
+	// BranchNames lists the app's branches from PICS ("public", "42.19", …) so a
+	// beta-branch workshop item can be looked for under the branch that holds it.
+	BranchNames []string
 	// LaunchEntries lists the app's PICS "config.launch" entries, if any.
 	LaunchEntries []LaunchEntry
 	fetched       time.Time
@@ -223,6 +226,12 @@ func parseAppInfo(log *slog.Logger, r proto.PICSAppResult) (*AppInfo, error) {
 				if id, err := strconv.ParseUint(ws, 10, 32); err == nil {
 					info.WorkshopDepot = uint32(id)
 				}
+			}
+			if branches, ok := dmap["branches"].(map[string]any); ok {
+				for name := range branches {
+					info.BranchNames = append(info.BranchNames, name)
+				}
+				sort.Strings(info.BranchNames)
 			}
 			for key, val := range dmap {
 				var depotID uint32

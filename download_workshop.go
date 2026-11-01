@@ -93,6 +93,21 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 		}
 	}
 
+	// A workshop item can belong to a beta branch, and Steam only issues a
+	// manifest code for the branch that holds it: Project Zomboid's Build 42
+	// items live under "42.19", not "public". Public is tried first, then every
+	// branch the app lists.
+	branches := make([]string, 0, 4)
+	branches = append(branches, "public")
+	seenBranch := map[string]bool{"public": true}
+	for _, name := range appInfo.BranchNames {
+		if name == "" || seenBranch[name] {
+			continue
+		}
+		seenBranch[name] = true
+		branches = append(branches, name)
+	}
+
 	// 5. Download manifest (with manifest request code for modern CDN auth).
 	if err := c.manifestSem.Acquire(ctx, 1); err != nil {
 		return err
@@ -118,44 +133,55 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 			slog.Debug("workshop: depot key failed", "depot", depotID, "err", keyErr)
 			continue
 		}
-		// A missing request code is not fatal: some CDN cells want it, others
-		// refuse a manifest that carries one, so both forms are tried. The code
-		// request itself can be lost on a busy connection, and a second attempt
-		// often returns the code the first one missed.
-		requestCode, codeErr := sess.GetManifestRequestCode(ctx, item.AppID, depotID, item.ManifestGID, "public")
-		if codeErr == nil && requestCode == 0 {
-			requestCode, codeErr = sess.GetManifestRequestCode(ctx, item.AppID, depotID, item.ManifestGID, "public")
-		}
-		if codeErr != nil {
-			lastErr = fmt.Errorf("depot %d manifest request code: %w", depotID, codeErr)
-			slog.Debug("workshop: no manifest request code", "depot", depotID, "err", codeErr)
-		}
-		slog.Debug("workshop: manifest request code", "depot", depotID, "code", requestCode, "err", codeErr)
-		codes := make([]uint64, 0, 2)
-		if requestCode > 0 {
-			codes = append(codes, requestCode)
-		}
-		codes = append(codes, 0)
-
-		for _, code := range codes {
-			fetched, fetchErr := c.fetchWorkshopManifest(ctx, tp, server, depotID, item, depotKey, code)
-			// A manifest that parses but lists nothing is not a success: the depot
-			// answered, but not with this item's files. Keep looking rather than
-			// reporting a finished download that installs nothing.
-			if fetchErr == nil && len(fetched.Files) == 0 {
-				fetchErr = fmt.Errorf("manifest listed no files")
-			}
-			if fetchErr == nil {
-				manifest = fetched
-				chosenDepotKey = depotKey
-				item.DepotID = depotID
-				slog.Debug("workshop: manifest fetched", "item", req.ItemID, "depot", depotID,
-					"code", code, "files", len(fetched.Files), "candidates", len(depots))
-				break
-			}
-			lastErr = fmt.Errorf("depot %d manifest (request code %d): %w", depotID, code, fetchErr)
-			slog.Debug("workshop: manifest attempt failed", "depot", depotID, "code", code, "err", fetchErr)
+		for _, branch := range branches {
 			if ctx.Err() != nil {
+				c.manifestSem.Release(1)
+				return ctx.Err()
+			}
+			// A missing request code is not fatal: some CDN cells want it, others
+			// refuse a manifest that carries one, so both forms are tried. The code
+			// request itself can be lost on a busy connection, and a second attempt
+			// often returns the code the first one missed.
+			requestCode, codeErr := sess.GetManifestRequestCode(ctx, item.AppID, depotID, item.ManifestGID, branch)
+			if codeErr == nil && requestCode == 0 {
+				requestCode, codeErr = sess.GetManifestRequestCode(ctx, item.AppID, depotID, item.ManifestGID, branch)
+			}
+			if codeErr != nil {
+				lastErr = fmt.Errorf("depot %d %s branch manifest request code: %w", depotID, branch, codeErr)
+				slog.Debug("workshop: no manifest request code", "depot", depotID, "branch", branch, "err", codeErr)
+				continue
+			}
+			codes := make([]uint64, 0, 2)
+			if requestCode > 0 {
+				codes = append(codes, requestCode)
+			}
+			codes = append(codes, 0)
+
+			for _, code := range codes {
+				fetched, fetchErr := c.fetchWorkshopManifest(ctx, tp, server, depotID, item, depotKey, code)
+				// A manifest that parses but lists nothing is not a success: the depot
+				// answered, but not with this item's files. Keep looking rather than
+				// reporting a finished download that installs nothing.
+				if fetchErr == nil && len(fetched.Files) == 0 {
+					fetchErr = fmt.Errorf("manifest listed no files")
+				}
+				if fetchErr == nil {
+					manifest = fetched
+					chosenDepotKey = depotKey
+					item.DepotID = depotID
+					slog.Debug("workshop: manifest fetched", "item", req.ItemID, "depot", depotID,
+						"branch", branch, "code", code, "files", len(fetched.Files))
+					break
+				}
+				lastErr = fmt.Errorf("depot %d %s branch manifest (request code %d): %w",
+					depotID, branch, code, fetchErr)
+				slog.Debug("workshop: manifest attempt failed", "depot", depotID,
+					"branch", branch, "code", code, "err", fetchErr)
+				if ctx.Err() != nil {
+					break
+				}
+			}
+			if manifest != nil {
 				break
 			}
 		}
