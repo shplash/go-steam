@@ -116,6 +116,19 @@ func (p *TokenProvider) InvalidateToken(depotID uint32, host string) {
 	p.mu.Unlock()
 }
 
+// TokenUnavailable reports whether the last token request for this host and
+// depot failed. GetToken treats that as anonymous access, so callers that then
+// see a refusal can say why.
+func (p *TokenProvider) TokenUnavailable(depotID uint32, host string) error {
+	key := fmt.Sprintf("%s/%d", host, depotID)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, bad := p.failures[key]; bad {
+		return fmt.Errorf("CDN token unavailable for depot %d on %s", depotID, host)
+	}
+	return nil
+}
+
 func (p *TokenProvider) fetchToken(ctx context.Context, depotID uint32, host string) (string, time.Time, error) {
 	req := proto.CContentServerDirectory_GetCDNAuthToken_Request{
 		DepotID:  depotID,

@@ -135,7 +135,20 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 
 	var manifest *cdn.Manifest
 	var chosenDepotKey []byte
-	var lastErr error
+	// Every refusal is worth keeping: the last one is usually the least useful,
+	// because the sweep ends on shared depots that were never going to answer.
+	var failures []string
+	addFailure := func(format string, args ...any) {
+		message := fmt.Sprintf(format, args...)
+		for _, seen := range failures {
+			if seen == message {
+				return
+			}
+		}
+		if len(failures) < 4 {
+			failures = append(failures, message)
+		}
+	}
 	for _, depotID := range depots {
 		if ctx.Err() != nil {
 			c.manifestSem.Release(1)
@@ -143,7 +156,7 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 		}
 		depotKey, keyErr := keyProvider.GetDepotKey(ctx, item.AppID, depotID)
 		if keyErr != nil {
-			lastErr = fmt.Errorf("depot %d key: %w", depotID, keyErr)
+			addFailure("depot %d key: %v", depotID, keyErr)
 			slog.Debug("workshop: depot key failed", "depot", depotID, "err", keyErr)
 			continue
 		}
@@ -161,7 +174,7 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 				requestCode, codeErr = sess.GetManifestRequestCode(ctx, item.AppID, depotID, item.ManifestGID, branch)
 			}
 			if codeErr != nil {
-				lastErr = fmt.Errorf("depot %d %s branch manifest request code: %w", depotID, branch, codeErr)
+				addFailure("depot %d %s branch manifest request code: %v", depotID, branch, codeErr)
 				slog.Debug("workshop: no manifest request code", "depot", depotID, "branch", branch, "err", codeErr)
 				continue
 			}
@@ -187,7 +200,7 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 						"branch", branch, "code", code, "files", len(fetched.Files))
 					break
 				}
-				lastErr = fmt.Errorf("depot %d %s branch manifest (request code %d): %w",
+				addFailure("depot %d %s branch manifest (request code %d): %v",
 					depotID, branch, code, fetchErr)
 				slog.Debug("workshop: manifest attempt failed", "depot", depotID,
 					"branch", branch, "code", code, "err", fetchErr)
@@ -217,21 +230,19 @@ func (c *Client) downloadWorkshopItem(ctx context.Context, req WorkshopDownloadR
 			}
 			return c.downloadWorkshopFile(ctx, req, item, send)
 		}
-		// Keep the depot failure: the cloud fallback only ran because the depot
-		// path failed, so replacing its error hides the reason we started here.
-		switch {
-		case cloudErr != nil && lastErr != nil:
-			lastErr = fmt.Errorf("%w; cloud fallback: %v", lastErr, cloudErr)
-		case cloudErr != nil:
-			lastErr = cloudErr
-		case file != nil && lastErr == nil:
-			lastErr = fmt.Errorf("Steam has no download URL for this item")
+		// Keep the depot failures: the cloud fallback only ran because the depot
+		// path failed, so replacing them would hide the reason we started here.
+		if cloudErr != nil {
+			addFailure("cloud fallback: %v", cloudErr)
+		} else if file != nil {
+			addFailure("cloud fallback: Steam has no download URL for this item")
 		}
+		detail := strings.Join(failures, "; ")
 		if guessedDepot {
-			return fmt.Errorf("workshop: manifest for item %d: Steam lists no workshop depot for app %d, so depots %v were tried and each refused it: %w",
-				req.ItemID, item.AppID, depots, lastErr)
+			return fmt.Errorf("workshop: manifest for item %d: Steam lists no workshop depot for app %d, so depots %v were tried and each refused it: %s",
+				req.ItemID, item.AppID, depots, detail)
 		}
-		return fmt.Errorf("workshop: manifest for item %d (depots %v): %w", req.ItemID, depots, lastErr)
+		return fmt.Errorf("workshop: manifest for item %d (depots %v): %s", req.ItemID, depots, detail)
 	}
 
 	// 5. Diff against target directory.
@@ -337,11 +348,15 @@ func (c *Client) fetchWorkshopManifest(
 	depotKey []byte,
 	requestCode uint64,
 ) (*cdn.Manifest, error) {
-	token, err := tp.GetToken(ctx, depotID, server.Host)
+	token, _ := tp.GetToken(ctx, depotID, server.Host)
+	manifest, err := cdn.DownloadManifest(ctx, c.cdnClient.HTTP(), server, depotID, item.ManifestGID, depotKey, token, requestCode)
 	if err != nil {
-		return nil, fmt.Errorf("CDN token: %w", err)
+		if tokenErr := tp.TokenUnavailable(depotID, server.Host); tokenErr != nil {
+			return nil, fmt.Errorf("%w (%v)", err, tokenErr)
+		}
+		return nil, err
 	}
-	return cdn.DownloadManifest(ctx, c.cdnClient.HTTP(), server, depotID, item.ManifestGID, depotKey, token, requestCode)
+	return manifest, nil
 }
 
 

@@ -557,6 +557,10 @@ func (t *tokenProviderWrapper) GetToken(ctx context.Context, depotID uint32, hos
 	return t.inner.GetToken(ctx, depotID, host)
 }
 
+func (t *tokenProviderWrapper) TokenUnavailable(depotID uint32, host string) error {
+	return t.inner.TokenUnavailable(depotID, host)
+}
+
 func (t *tokenProviderWrapper) InvalidateToken(depotID uint32, host string) {
 	t.inner.InvalidateToken(depotID, host)
 }
