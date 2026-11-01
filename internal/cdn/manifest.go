@@ -108,7 +108,20 @@ func DownloadManifest(
 	//   [size bytes]: proto-encoded section
 	//
 	// We parse each section and combine into the final Manifest.
-	return decodeManifest(raw, depotKey, depotID, manifestGID)
+	m, err := decodeManifest(raw, depotKey, depotID, manifestGID)
+	if err != nil {
+		return nil, err
+	}
+	// A manifest with nothing in it means the body was not a shape we can read,
+	// so say how it started: that is the only way to identify the format.
+	if len(m.Files) == 0 {
+		prefix := raw
+		if len(prefix) > 32 {
+			prefix = prefix[:32]
+		}
+		return nil, fmt.Errorf("manifest: no files (%d bytes, starts %x)", len(raw), prefix)
+	}
+	return m, nil
 }
 
 func decodeManifest(raw, depotKey []byte, depotID uint32, gid uint64) (*Manifest, error) {
