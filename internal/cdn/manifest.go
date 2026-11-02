@@ -178,8 +178,15 @@ func decodeManifest(raw, depotKey []byte, depotID uint32, gid uint64) (*Manifest
 		}
 	}
 
-	// Decrypt filenames if the manifest uses encrypted filenames.
-	if metadata.FilenamesEncrypted && len(depotKey) == 32 {
+	// Decrypt filenames when the manifest says they are encrypted, and when they
+	// simply look that way: a name that decrypts cleanly is a ciphertext name,
+	// and leaving it alone would put every file in the mod's root under a blob.
+	encrypted := metadata.FilenamesEncrypted
+	if !encrypted && payloadLooksEncrypted(payload, depotKey) {
+		encrypted = true
+		slog.Debug("decodeManifest: filenames look encrypted", "depot", depotID)
+	}
+	if encrypted && len(depotKey) == 32 {
 		slog.Debug("decodeManifest: decrypting filenames", "depot", depotID)
 		for i := range payload.Mappings {
 			plain, err := decryptFilename(payload.Mappings[i].Filename, depotKey)
@@ -201,7 +208,7 @@ func decodeManifest(raw, depotKey []byte, depotID uint32, gid uint64) (*Manifest
 		})
 	}
 
-	slog.Debug("decodeManifest: result", "depot", depotID, "files", len(payload.Mappings), "filenames_encrypted", metadata.FilenamesEncrypted)
+	slog.Debug("decodeManifest: result", "depot", depotID, "files", len(payload.Mappings), "filenames_encrypted", encrypted)
 
 	// Build our Manifest from the parsed data.
 	m := &Manifest{
@@ -578,13 +585,7 @@ func walkMagicSections(body, depotKey []byte, payload proto.ContentManifestPaylo
 				}
 			}
 		case 0x1F4812BE:
-			for _, candidate := range sectionCandidates(section, depotKey) {
-				var m proto.ContentManifestMetadata
-				if m.Unmarshal(candidate) == nil && (m.DepotID != 0 || m.GIDManifest != 0 || m.FilenamesEncrypted) {
-					metadata = m
-					break
-				}
-			}
+			mergeMetadata(section, depotKey, &metadata)
 		}
 	}
 	return payload, metadata
@@ -613,13 +614,7 @@ func walkSizeSections(body, depotKey []byte, payload proto.ContentManifestPayloa
 		if len(payload.Mappings) > 0 {
 			continue
 		}
-		for _, candidate := range sectionCandidates(section, depotKey) {
-			var m proto.ContentManifestMetadata
-			if m.Unmarshal(candidate) == nil && (m.DepotID != 0 || m.GIDManifest != 0 || m.FilenamesEncrypted) {
-				metadata = m
-				break
-			}
-		}
+		mergeMetadata(section, depotKey, &metadata)
 	}
 	return payload, metadata
 }
@@ -640,4 +635,46 @@ func sectionCandidates(section, depotKey []byte) [][]byte {
 		}
 	}
 	return candidates
+}
+
+
+// mergeMetadata reads a metadata section, keeping whatever each candidate can
+// tell us: a ciphertext candidate that happens to parse must not hide the
+// "filenames are encrypted" flag held by the candidate that decoded properly.
+func mergeMetadata(section, depotKey []byte, metadata *proto.ContentManifestMetadata) {
+	for _, candidate := range sectionCandidates(section, depotKey) {
+		var m proto.ContentManifestMetadata
+		if m.Unmarshal(candidate) != nil {
+			continue
+		}
+		if metadata.DepotID == 0 && m.DepotID != 0 {
+			metadata.DepotID = m.DepotID
+		}
+		if metadata.GIDManifest == 0 && m.GIDManifest != 0 {
+			metadata.GIDManifest = m.GIDManifest
+		}
+		if metadata.CreationTime == 0 && m.CreationTime != 0 {
+			metadata.CreationTime = m.CreationTime
+		}
+		if metadata.CbDiskOriginal == 0 && m.CbDiskOriginal != 0 {
+			metadata.CbDiskOriginal = m.CbDiskOriginal
+		}
+		if m.FilenamesEncrypted {
+			metadata.FilenamesEncrypted = true
+		}
+	}
+}
+
+// payloadLooksEncrypted reports whether the file names decrypt cleanly, which
+// only happens when they were encrypted in the first place.
+func payloadLooksEncrypted(payload proto.ContentManifestPayload, depotKey []byte) bool {
+	if len(depotKey) != 32 || len(payload.Mappings) == 0 {
+		return false
+	}
+	name := payload.Mappings[0].Filename
+	if name == "" {
+		return false
+	}
+	plain, err := decryptFilename(name, depotKey)
+	return err == nil && plain != "" && plain != name
 }
