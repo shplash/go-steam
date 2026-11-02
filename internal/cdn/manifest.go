@@ -178,7 +178,7 @@ func decodeManifest(raw, depotKey []byte, depotID uint32, gid uint64) (*Manifest
 		}
 	}
 
-	// Decrypt filenames when the manifest says they are encrypted, and when they
+	// Decrypt file names when the manifest says they are encrypted, and when they
 	// simply look that way: a name that decrypts cleanly is a ciphertext name,
 	// and leaving it alone would put every file in the mod's root under a blob.
 	encrypted := metadata.FilenamesEncrypted
@@ -186,26 +186,42 @@ func decodeManifest(raw, depotKey []byte, depotID uint32, gid uint64) (*Manifest
 		encrypted = true
 		slog.Debug("decodeManifest: filenames look encrypted", "depot", depotID)
 	}
-	if encrypted && len(depotKey) == 32 {
-		slog.Debug("decodeManifest: decrypting filenames", "depot", depotID)
+	if len(depotKey) == 32 {
 		for i := range payload.Mappings {
-			plain, err := decryptFilename(payload.Mappings[i].Filename, depotKey)
-			if err == nil {
-				payload.Mappings[i].Filename = plain
+			f := &payload.Mappings[i]
+			// A name that is a ciphertext blob in its own right is decrypted
+			// whatever the manifest's flag said: some manifests carry the flag
+			// unset, and trusting the flag alone left whole items written out
+			// under blobs.
+			if !encrypted && !looksLikeCiphertext(f.Filename) {
+				continue
 			}
-			if payload.Mappings[i].LinktargetPath != "" {
-				if plain, err := decryptFilename(payload.Mappings[i].LinktargetPath, depotKey); err == nil {
-					payload.Mappings[i].LinktargetPath = plain
+			if plain, err := decryptFilename(f.Filename, depotKey); err == nil && plain != "" {
+				f.Filename = plain
+			}
+			if f.LinktargetPath != "" {
+				if plain, err := decryptFilename(f.LinktargetPath, depotKey); err == nil {
+					f.LinktargetPath = plain
 				}
 			}
 		}
-		// Steam stores encrypted manifests ordered by encrypted filename; once the
-		// names are in the clear, re-sort alphabetically so the file order matches
-		// the canonical (decrypted) manifest. Mirrors SteamKit2 DecryptFilenames,
-		// which sorts by filename using OrdinalIgnoreCase.
-		sort.SliceStable(payload.Mappings, func(i, j int) bool {
-			return strings.ToLower(payload.Mappings[i].Filename) < strings.ToLower(payload.Mappings[j].Filename)
-		})
+		if encrypted {
+			// Steam stores encrypted manifests ordered by encrypted filename; once
+			// the names are in the clear, re-sort alphabetically so the file order
+			// matches the canonical (decrypted) manifest. Mirrors SteamKit2
+			// DecryptFilenames, which sorts by filename using OrdinalIgnoreCase.
+			sort.SliceStable(payload.Mappings, func(i, j int) bool {
+				return strings.ToLower(payload.Mappings[i].Filename) < strings.ToLower(payload.Mappings[j].Filename)
+			})
+		}
+	}
+
+	// Names that are still ciphertext mean the depot key does not match this
+	// manifest. Writing them out installs the item as thousands of blobs in one
+	// folder, which reads as a broken mod rather than a download that failed, so
+	// refuse it here where the reason is still known.
+	if namesLookLikeCiphertext(payload.Mappings) {
+		return nil, fmt.Errorf("manifest: depot %d file names did not decrypt; the depot key does not match this manifest", depotID)
 	}
 
 	slog.Debug("decodeManifest: result", "depot", depotID, "files", len(payload.Mappings), "filenames_encrypted", encrypted)
@@ -666,15 +682,70 @@ func mergeMetadata(section, depotKey []byte, metadata *proto.ContentManifestMeta
 }
 
 // payloadLooksEncrypted reports whether the file names decrypt cleanly, which
-// only happens when they were encrypted in the first place.
+// only happens when they were encrypted in the first place. Several names are
+// looked at rather than the first one: a single name can fail to decrypt for
+// reasons that say nothing about the manifest (an unusually long path, a
+// directory entry), and deciding on that one sample left whole items written
+// out under ciphertext names.
 func payloadLooksEncrypted(payload proto.ContentManifestPayload, depotKey []byte) bool {
-	if len(depotKey) != 32 || len(payload.Mappings) == 0 {
+	if len(depotKey) != 32 {
 		return false
 	}
-	name := payload.Mappings[0].Filename
-	if name == "" {
+	checked, decrypted := 0, 0
+	for _, f := range payload.Mappings {
+		if f.Flags&fileDir != 0 || f.Filename == "" {
+			continue
+		}
+		checked++
+		if plain, err := decryptFilename(f.Filename, depotKey); err == nil && plain != "" && plain != f.Filename {
+			decrypted++
+		}
+		if checked == 8 {
+			break
+		}
+	}
+	return checked > 0 && decrypted*2 > checked
+}
+
+// namesLookLikeCiphertext reports whether most of the manifest's names are still
+// base64 blobs of AES blocks, which is what a manifest decrypted with the wrong
+// depot key looks like.
+func namesLookLikeCiphertext(mappings []proto.ContentManifestFile) bool {
+	checked, blobs := 0, 0
+	for _, f := range mappings {
+		if f.Flags&fileDir != 0 || f.Filename == "" {
+			continue
+		}
+		checked++
+		if looksLikeCiphertext(f.Filename) {
+			blobs++
+		}
+		if checked == 32 {
+			break
+		}
+	}
+	return checked > 0 && blobs*2 > checked
+}
+
+// looksLikeCiphertext reports whether a name is a base64 blob of an AES
+// payload: Steam's encrypted names are an encrypted IV followed by whole blocks.
+// Names that carry an extension, or any character base64 does not use, are real
+// file names and never match.
+func looksLikeCiphertext(name string) bool {
+	if len(name) < 44 || strings.Contains(name, ".") {
 		return false
 	}
-	plain, err := decryptFilename(name, depotKey)
-	return err == nil && plain != "" && plain != name
+	for _, r := range name {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+		case r == '+', r == '/', r == '=':
+		default:
+			return false
+		}
+	}
+	raw, err := base64.StdEncoding.DecodeString(name)
+	if err != nil {
+		return false
+	}
+	return len(raw) >= 32 && len(raw)%16 == 0
 }

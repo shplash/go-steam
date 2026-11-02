@@ -168,6 +168,69 @@ func TestDecodeManifest_SkipsDirectories(t *testing.T) {
 	}
 }
 
+// ciphertextName encrypts a path the way Steam does for a manifest that keeps
+// its file names encrypted.
+func ciphertextName(t *testing.T, path string, key []byte) string {
+	t.Helper()
+	enc, err := symmetricEncryptTest([]byte(path), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.StdEncoding.EncodeToString(enc)
+}
+
+// Regression test: a manifest that leaves the "names are encrypted" flag unset
+// used to be judged on its first name alone, so a single name that did not
+// decrypt left every other file of the item written out flat under a blob. The
+// rest decrypt, so the whole manifest must be decrypted.
+func TestDecodeManifest_DecryptsNamesFromMoreThanOneSample(t *testing.T) {
+	key := bytes.Repeat([]byte{0x37}, 32)
+	sha := make([]byte, 20)
+	plain := encodeFileProto("readme.txt", 4, 0, sha, encodeChunkProto(sha, 0, 4, 4))
+	encrypted := [][]byte{
+		encodeFileProto(ciphertextName(t, "prototypes/vehicle.script", key), 4, 0, sha, encodeChunkProto(sha, 0, 4, 4)),
+		encodeFileProto(ciphertextName(t, "scripts/4_shared/main.nut", key), 4, 0, sha, encodeChunkProto(sha, 0, 4, 4)),
+		encodeFileProto(ciphertextName(t, "scripts/4_shared/client.nut", key), 4, 0, sha, encodeChunkProto(sha, 0, 4, 4)),
+	}
+	// The plain name comes first, which is the sample the old check used.
+	raw := lenPrefixedSection(encodePayloadProto(append([][]byte{plain}, encrypted...)...))
+
+	m, err := decodeManifest(raw, key, 3441461, 42)
+	if err != nil {
+		t.Fatalf("decodeManifest: %v", err)
+	}
+	want := []string{"prototypes/vehicle.script", "readme.txt", "scripts/4_shared/client.nut", "scripts/4_shared/main.nut"}
+	got := make([]string, 0, len(m.Files))
+	for _, f := range m.Files {
+		got = append(got, f.Path)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("paths = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("paths = %q, want %q", got, want)
+		}
+	}
+}
+
+// A manifest whose names do not decrypt is refused rather than installed as a
+// folder of blobs, which is what a mod flattened into its root looks like.
+func TestDecodeManifest_RefusesNamesThatDidNotDecrypt(t *testing.T) {
+	key := bytes.Repeat([]byte{0x51}, 32)
+	wrong := bytes.Repeat([]byte{0x52}, 32)
+	sha := make([]byte, 20)
+	var files [][]byte
+	for _, path := range []string{"a/a.txt", "b/b.txt", "c/c.txt", "d/d.txt", "e/e.txt", "f/f.txt"} {
+		files = append(files, encodeFileProto(ciphertextName(t, path, key), 4, 0, sha, encodeChunkProto(sha, 0, 4, 4)))
+	}
+	raw := lenPrefixedSection(encodePayloadProto(files...))
+
+	if _, err := decodeManifest(raw, wrong, 3441461, 42); err == nil {
+		t.Fatal("expected an error for names that did not decrypt")
+	}
+}
+
 func TestDownloadManifest_TLS(t *testing.T) {
 	sha := make([]byte, 20)
 	sha[0] = 0x11
